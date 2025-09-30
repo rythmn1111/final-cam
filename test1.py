@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from subprocess import run, CalledProcessError
 from threading import Thread, Lock
-from time import sleep
+from time import sleep, time
 
 from flask import Flask, Response, jsonify, send_file, abort, render_template_string
 from subprocess import PIPE
@@ -70,6 +70,9 @@ except Exception:
     FONT      = ImageFont.load_default()
 
 lcd_lock = Lock()
+
+# Window to accept a button press to upload after capture (epoch seconds)
+_upload_prompt_deadline = 0.0
 
 def lcd_show_text(line1="Ready", line2="Press button / Web"):
     """Render two centered lines on the LCD."""
@@ -225,8 +228,10 @@ def capture_once():
         # 3s LCD preview of the actual stored image
         lcd_show_preview(final_img, seconds=3.0)
 
-        # Back to Ready
-        lcd_show_text("Ready", "Press button / Web")
+        # Offer upload via LCD button for 5 seconds
+        global _upload_prompt_deadline
+        lcd_show_text("Upload to Arweave?", "Press within 5s")
+        _upload_prompt_deadline = time() + 5.0
         print(f"Captured {ts_path}  (q≈{used_q}, bytes={len(webp_bytes)})")
 
         _broadcast({"type": "captured", "ts": int(datetime.now().timestamp())})
@@ -242,7 +247,22 @@ def button_worker():
     print("Button worker ready (press to capture).")
     while True:
         btn.wait_for_press()
-        capture_once()
+        now = time()
+        global _upload_prompt_deadline
+        if _upload_prompt_deadline and now < _upload_prompt_deadline:
+            # consume window and perform upload
+            _upload_prompt_deadline = 0.0
+            lcd_show_text("Uploading…", "to Arweave")
+            ok, info = _perform_arweave_upload()
+            if ok:
+                lcd_show_text("Uploaded", "Arweave OK")
+            else:
+                lcd_show_text("Upload FAIL", "See logs")
+                print("Arweave upload failed:", info)
+            sleep(1.5)
+            lcd_show_text("Ready", "Press button / Web")
+        else:
+            capture_once()
         sleep(0.2)
 
 # =============== SSE (server-sent events) ===============
@@ -349,45 +369,6 @@ const countLocal = document.getElementById("countLocal");
 const gridAr = document.getElementById("gridAr");
 const countAr = document.getElementById("countAr");
 
-let promptTimer = null;
-let promptEl = null;
-function showUploadPrompt() {
-  // Create a temporary prompt under the hero image for 5s
-  clearUploadPrompt();
-  const hero = document.querySelector(".hero");
-  promptEl = document.createElement("div");
-  promptEl.style.marginTop = "8px";
-  let secs = 5;
-  promptEl.innerHTML = `
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span class="muted">Upload to Arweave?</span>
-      <button id="uploadNowBtn">Upload</button>
-      <span class="muted" id="countdown">(5s)</span>
-    </div>
-  `;
-  hero.appendChild(promptEl);
-  const btnUpload = promptEl.querySelector('#uploadNowBtn');
-  const cd = promptEl.querySelector('#countdown');
-  btnUpload.addEventListener('click', async () => {
-    btnUpload.disabled = true;
-    cd.textContent = '(uploading…)';
-    await uploadToArweave();
-    clearUploadPrompt();
-  });
-  promptTimer = setInterval(() => {
-    secs -= 1;
-    if (secs <= 0) {
-      clearUploadPrompt();
-    } else {
-      cd.textContent = `(${secs}s)`;
-    }
-  }, 1000);
-}
-function clearUploadPrompt(){
-  if (promptTimer){ clearInterval(promptTimer); promptTimer = null; }
-  if (promptEl){ promptEl.remove(); promptEl = null; }
-}
-
 async function capture() {
   btn.disabled = true;
   btn.textContent = "Capturing…";
@@ -399,8 +380,6 @@ async function capture() {
     img.src = "/latest.webp?ts=" + Date.now();
     statusEl.textContent = "Done.";
     await refreshGallery();
-    // After successful capture, show Arweave upload prompt for 5 seconds
-    showUploadPrompt();
   } catch (e) {
     console.error(e);
     statusEl.textContent = e.message || "Failed to capture. Check server logs.";
@@ -420,7 +399,6 @@ try {
       if (msg.type === "captured") {
         img.src = "/latest.webp?ts=" + msg.ts;
         await refreshGallery();
-        showUploadPrompt();
       }
     } catch {}
   };
@@ -490,19 +468,7 @@ async function refreshArweave(){
   }
 }
 
-async function uploadToArweave(){
-  statusEl.textContent = "Uploading to Arweave…";
-  try{
-    const r = await fetch("/upload_arweave", { method: "POST" });
-    const data = await r.json();
-    if (!data.ok) throw new Error(data.error || 'Upload failed');
-    statusEl.textContent = "Uploaded to Arweave.";
-    await refreshArweave();
-  }catch(e){
-    console.error(e);
-    statusEl.textContent = e.message || 'Upload failed';
-  }
-}
+(async function noop(){})();
 
 (async function init(){
   img.src = "/latest.webp?ts=" + Date.now();
@@ -583,46 +549,52 @@ def _append_arweave_record(record):
 @app.route("/upload_arweave", methods=["POST"])
 def upload_arweave():
     try:
-        # choose latest file (use latest.webp if exists)
-        src = LATEST_WEBP if os.path.exists(LATEST_WEBP) else None
-        if not src or not os.path.exists(src):
-            # fallback to newest .webp in folder
-            files = _list_webps_sorted()
-            if files:
-                src = str(files[-1])
-        if not src or not os.path.exists(src):
-            return jsonify({"ok": False, "error": "No image available to upload"}), 400
-
-        # call Node uploader with --json
-        here = os.path.dirname(os.path.abspath(__file__))
-        upload_js = os.path.join(here, "upload.js")
-        if not os.path.exists(upload_js):
-            return jsonify({"ok": False, "error": "upload.js not found"}), 500
-
-        try:
-            proc = run(["node", upload_js, "--json", src], check=True, stdout=PIPE, stderr=PIPE)
-            out = proc.stdout.decode("utf-8", errors="ignore").strip()
-            data = json.loads(out)
-        except CalledProcessError as e:
-            err = e.stderr.decode("utf-8", errors="ignore")
-            return jsonify({"ok": False, "error": err or str(e)}), 500
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-        if not data.get("ok"):
-            return jsonify({"ok": False, "error": data.get("error", "Upload failed")}), 500
-
-        record = {
-            "id": data.get("id"),
-            "url": data.get("url"),
-            "size": data.get("size"),
-            "file": data.get("file"),
-            "tsMs": int(datetime.now().timestamp() * 1000),
-        }
-        _append_arweave_record(record)
-        return jsonify({"ok": True, "record": record})
+        ok, payload = _perform_arweave_upload()
+        if not ok:
+            return jsonify({"ok": False, "error": payload}), 500
+        return jsonify({"ok": True, "record": payload})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+def _perform_arweave_upload():
+    """Uploads latest .webp to Arweave using Node helper, persists record, returns (ok, data|error)."""
+    # choose latest file (use latest.webp if exists)
+    src = LATEST_WEBP if os.path.exists(LATEST_WEBP) else None
+    if not src or not os.path.exists(src):
+        files = _list_webps_sorted()
+        if files:
+            src = str(files[-1])
+    if not src or not os.path.exists(src):
+        return False, "No image available to upload"
+
+    # call Node uploader with --json
+    here = os.path.dirname(os.path.abspath(__file__))
+    upload_js = os.path.join(here, "upload.js")
+    if not os.path.exists(upload_js):
+        return False, "upload.js not found"
+
+    try:
+        proc = run(["node", upload_js, "--json", src], check=True, stdout=PIPE, stderr=PIPE)
+        out = proc.stdout.decode("utf-8", errors="ignore").strip()
+        data = json.loads(out)
+    except CalledProcessError as e:
+        err = e.stderr.decode("utf-8", errors="ignore")
+        return False, err or str(e)
+    except Exception as e:
+        return False, str(e)
+
+    if not data.get("ok"):
+        return False, data.get("error", "Upload failed")
+
+    record = {
+        "id": data.get("id"),
+        "url": data.get("url"),
+        "size": data.get("size"),
+        "file": data.get("file"),
+        "tsMs": int(datetime.now().timestamp() * 1000),
+    }
+    _append_arweave_record(record)
+    return True, record
 
 @app.route("/capture", methods=["POST"])
 def capture():
