@@ -204,7 +204,8 @@ def gallery():
             "name": f.name,
             "url": f"/img/{f.name}",
             "size": st.st_size,
-            "mtimeMs": int(st.st_mtime * 1000),
+         @app.route("/img/<path:name>")
+   "mtimeMs": int(st.st_mtime * 1000),
         })
     return jsonify({"ok": True, "local": items})
 
@@ -218,7 +219,7 @@ def capture():
 
 def main():
     Thread(target=button_worker, daemon=True).start()
-    app.run(host="0.0.0.0", port=3000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
 if __name__ == "__main__":
     main()
