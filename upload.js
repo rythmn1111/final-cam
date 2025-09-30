@@ -88,6 +88,7 @@ function assertFile(p) {
     startedAt,
     finishedAt: Date.now(),
     file: path.basename(filePath),
+    supabase: { ok: false, error: null },
   };
   // Optional: insert into Supabase if env vars are present
   try {
@@ -100,12 +101,22 @@ function assertFile(p) {
       const supabase = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
       const insertData = { [linkColumn]: payload.url };
       const { error } = await supabase.from(table).insert(insertData);
-      if (error && !IS_JSON) console.warn("[supabase] insert error:", error.message || error);
+      if (error) {
+        payload.supabase.ok = false;
+        payload.supabase.error = error.message || String(error);
+        // Always emit to stderr for diagnostics
+        try { console.error("[supabase] insert error:", payload.supabase.error); } catch {}
+      } else {
+        payload.supabase.ok = true;
+      }
     } else if (!IS_JSON) {
       console.log("[supabase] Skipped insert (missing SUPABASE_URL or key)");
     }
   } catch (e) {
-    if (!IS_JSON) console.warn("[supabase] insert failed:", e?.message || e);
+    const msg = e?.message || String(e);
+    payload.supabase.ok = false;
+    payload.supabase.error = msg;
+    try { console.error("[supabase] insert failed:", msg); } catch {}
   }
   if (IS_JSON) {
     console.log(JSON.stringify(payload));
