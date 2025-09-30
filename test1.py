@@ -73,6 +73,19 @@ lcd_lock = Lock()
 
 # Window to accept a button press to upload after capture (epoch seconds)
 _upload_prompt_deadline = 0.0
+_upload_window_id = 0
+
+def _schedule_upload_window_reset(expected_deadline, window_id):
+    def worker():
+        remain = max(0.0, expected_deadline - time())
+        if remain > 0:
+            sleep(remain)
+        # Only reset if nothing happened (no press and not superseded by a new window)
+        global _upload_prompt_deadline, _upload_window_id
+        if _upload_window_id == window_id and abs(_upload_prompt_deadline - expected_deadline) < 0.001:
+            _upload_prompt_deadline = 0.0
+            lcd_show_text("Ready", "Press button / Web")
+    Thread(target=worker, daemon=True).start()
 
 def lcd_show_text(line1="Ready", line2="Press button / Web"):
     """Render two centered lines on the LCD."""
@@ -232,6 +245,11 @@ def capture_once():
         global _upload_prompt_deadline
         lcd_show_text("Upload to Arweave?", "Press within 5s")
         _upload_prompt_deadline = time() + 5.0
+        # schedule automatic reset back to Ready if no press within window
+        global _upload_window_id
+        _upload_window_id += 1
+        this_id = _upload_window_id
+        _schedule_upload_window_reset(_upload_prompt_deadline, this_id)
         print(f"Captured {ts_path}  (q≈{used_q}, bytes={len(webp_bytes)})")
 
         _broadcast({"type": "captured", "ts": int(datetime.now().timestamp())})
