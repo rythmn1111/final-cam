@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Single-file Pi camera app: WebP-only (<=100 KB), B/W capture + gallery + SSE +
-# Waveshare ST7735 (rotated 90°) + 3s on-LCD preview (scaled to fit)
+# Pi camera app (optimized): WebP-only (<=100 KB), grayscale, faster capture,
+# LCD rotated 90°, 3s on-LCD preview (scaled), gallery, SSE updates.
 
 import os
 import io
@@ -22,14 +22,25 @@ from st7735 import ST7735
 USER_HOME      = os.path.expanduser("~")
 PHOTOS_DIR     = os.path.join(USER_HOME, "photos")
 LATEST_WEBP    = os.path.join(PHOTOS_DIR, "latest.webp")
-CAP_W, CAP_H   = 1024, 1024          # capture size (square)
+
+# Resolution (keep 1024 if you like; dropping to ~900 can shave more time)
+CAP_W, CAP_H   = 1024, 1024
+
 BUTTON_BCM     = 13                  # joystick press pin
-AUTOFOCUS      = True                # set False if your module lacks AF
-PORT           = int(os.environ.get("PORT", "5050"))    # avoid clashes
-MAX_BYTES      = 100 * 1024          # 100 KB hard cap for every saved image
-Q_MIN, Q_MAX   = 30, 95              # WebP quality search bounds
-MIN_SIDE_PX    = 640                 # don't shrink smaller than this shorter side
-WEBP_METHOD    = 6                   # compression effort (0-6)
+# BIG speed win: disable AF (continuous AF can stall seconds)
+AUTOFOCUS      = False               # set True only if you need AF and your module supports it
+
+PORT           = int(os.environ.get("PORT", "5050"))
+MAX_BYTES      = 100 * 1024          # 100 KB hard cap per saved image
+
+# WebP encoder tuning (lighter for speed)
+Q_MIN, Q_MAX   = 30, 92              # slightly lower max to avoid wasteful tries
+MIN_SIDE_PX    = 640                 # do not shrink below this shorter side
+WEBP_METHOD    = 4                   # 0-6; 4 is much faster than 6 with small quality tradeoff
+MAX_DOWNSCALE_STEPS = 5              # cap attempts
+
+# RAM tmp to avoid SD I/O latency
+TMP_PATH       = "/dev/shm/shot.jpg"
 
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
@@ -75,9 +86,9 @@ def lcd_show_text(line1="Ready", line2="Press button / Web"):
         disp.display(img)
 
 def lcd_show_preview(pil_img, seconds=3.0):
-    """Show a scaled, centered preview of pil_img on the LCD for 'seconds'."""
+    """Scaled, centered preview on LCD (use BILINEAR for speed)."""
     im = pil_img.convert("RGB").copy()
-    im.thumbnail((WIDTH, HEIGHT), Image.LANCZOS)
+    im.thumbnail((WIDTH, HEIGHT), Image.BILINEAR)
     canvas = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
     x = (WIDTH - im.width) // 2
     y = (HEIGHT - im.height) // 2
@@ -89,88 +100,87 @@ def lcd_show_preview(pil_img, seconds=3.0):
 lcd_show_text("Ready", "Press button / Web")
 
 # =============== WebP (<=100 KB) encoder helpers ===============
+_last_good_q = 78  # heuristic starting point; updated after each success
+
 def _encode_webp(img, quality):
     """Encode PIL image to WebP bytes with given quality."""
     buf = io.BytesIO()
-    # Strip metadata by default (Pillow doesn't copy EXIF unless provided)
-    img.save(buf, format="WEBP", quality=quality, method=WEBP_METHOD)
+    img.save(buf, format="WEBP", quality=int(quality), method=WEBP_METHOD)
     return buf.getvalue()
 
-def _quality_search_under_cap(img, max_bytes, q_min=Q_MIN, q_max=Q_MAX):
+def _quality_search_under_cap(img, max_bytes, q_min=Q_MIN, q_max=Q_MAX, start_q=None, max_steps=5):
     """
-    Binary search the highest WebP quality that fits under max_bytes.
+    Binary/stepped search for a quality <= max_bytes.
+    Uses a biased start near last known good to cut attempts. Caps steps.
     Returns (bytes, quality, fits_under_cap_bool).
-    If nothing fits (even at q_min), returns (bytes_at_q_min, q_min, False).
     """
+    if start_q is None:
+        start_q = max(q_min, min(q_max, _last_good_q))
+
+    # Quick try at start_q
+    data = _encode_webp(img, start_q)
+    if len(data) <= max_bytes:
+        return data, start_q, True
+
+    # Boundaries for search
     lo, hi = q_min, q_max
-    best_bytes = None
-    best_q = None
-    while lo <= hi:
+    # If start_q too large, move hi left
+    if len(data) > max_bytes:
+        hi = start_q - 1
+
+    best_bytes, best_q = None, None
+    steps = 0
+    while lo <= hi and steps < max_steps:
         mid = (lo + hi) // 2
         data = _encode_webp(img, mid)
         if len(data) <= max_bytes:
             best_bytes, best_q = data, mid
-            lo = mid + 1  # try higher quality
+            lo = mid + 1
         else:
-            hi = mid - 1  # need lower quality
+            hi = mid - 1
+        steps += 1
+
     if best_bytes is not None:
         return best_bytes, best_q, True
-    # Nothing fit; return the smallest quality result for caller to decide next step
+
+    # Nothing fit within steps → try the floor as a fallback result
     data = _encode_webp(img, q_min)
     return data, q_min, False
 
-def _downscale_to_limit(img, max_bytes, min_side=MIN_SIDE_PX, q_min=Q_MIN, q_max=Q_MAX):
+def _downscale_to_limit(img, max_bytes, min_side=MIN_SIDE_PX):
     """
-    Attempt: quality search; if it fails, progressively downscale and retry.
-    Returns (final_img, final_bytes, final_quality).
+    Try a quick quality search; if not under cap, progressively downscale + retry.
+    Uses BILINEAR for speed.
     """
-    # Start with current image
-    work = img
-    # Try up to a few downscale iterations
-    for _ in range(8):
-        data, q, ok = _quality_search_under_cap(work, max_bytes, q_min, q_max)
-        if ok:
-            return work, data, q
-        # Still too big at q_min -> compute a scale factor based on size ratio, then clamp
-        if min(work.size) <= min_side:
-            # Already at minimum side; accept q_min result (will be > cap but we must enforce cap → so force further downscale)
-            pass
-        # Heuristic scale: target area scales ~ with size, so use sqrt ratio
-        # If data is D and target is T, scale ≈ sqrt(T/D)
-        ratio = max_bytes / max(len(data), 1)
-        scale = max(0.5, min(0.9, math.sqrt(ratio)))  # clamp between 0.5 and 0.9 to avoid extremes
-        new_w = max(min_side, int(work.width * scale))
-        new_h = max(min_side, int(work.height * scale))
-        # Ensure we actually shrink
-        if new_w >= work.width or new_h >= work.height:
-            # Force a small step down if ratio suggested no shrink
-            new_w = max(min_side, int(work.width * 0.9))
-            new_h = max(min_side, int(work.height * 0.9))
-            if new_w == work.width and new_h == work.height:
-                # Can't shrink further; accept the q_min result (may exceed cap a bit)
-                # BUT we promised a hard cap → do an extra step: downscale to min_side and retry once more
-                if min(work.size) > min_side:
-                    work = work.resize(_fit_size_keep_aspect(work.size, min_side), Image.LANCZOS)
-                    continue
-                # As a last resort, keep shrinking by 0.85 factor until fits
-                w, h = work.size
-                work = work.resize((max(min_side, int(w*0.85)), max(min_side, int(h*0.85))), Image.LANCZOS)
-                continue
-        # Resize and loop
-        work = work.resize((new_w, new_h), Image.LANCZOS)
-    # Final attempt after loop
-    data, q, ok = _quality_search_under_cap(work, max_bytes, q_min, q_max)
-    return work, data, q
+    global _last_good_q
 
-def _fit_size_keep_aspect(size, min_side):
-    w, h = size
-    if w <= 0 or h <= 0:
-        return (min_side, min_side)
-    if w < h:
-        scale = min_side / w
-    else:
-        scale = min_side / h
-    return (max(1, int(w * scale)), max(1, int(h * scale)))
+    work = img
+    for step in range(MAX_DOWNSCALE_STEPS):
+        data, q, ok = _quality_search_under_cap(work, max_bytes, start_q=_last_good_q)
+        if ok:
+            _last_good_q = q  # remember for next capture
+            return work, data, q
+
+        # Still too big at low quality → shrink
+        w, h = work.size
+        if min(w, h) <= min_side:
+            # Force an extra 0.85 step if still too large
+            scale = 0.85
+        else:
+            # Heuristic: scale by sqrt(target/current)
+            ratio = max_bytes / max(len(data), 1)
+            scale = max(0.70, min(0.92, math.sqrt(ratio)))
+        new_w = max(min_side, int(w * scale))
+        new_h = max(min_side, int(h * scale))
+        if new_w >= w and new_h >= h:
+            new_w = max(min_side, int(w * 0.9))
+            new_h = max(min_side, int(h * 0.9))
+        work = work.resize((new_w, new_h), Image.BILINEAR)
+
+    # Final attempt after steps exhausted
+    data, q, ok = _quality_search_under_cap(work, max_bytes, start_q=_last_good_q)
+    _last_good_q = q
+    return work, data, q
 
 # =============== Capture logic ===============
 btn = Button(BUTTON_BCM, pull_up=True, bounce_time=0.15)
@@ -182,14 +192,12 @@ def _list_webps_sorted():
     return files
 
 def capture_once():
-    tmp_path = "/tmp/shot.jpg"
-
     lcd_show_text("Capturing...", datetime.now().strftime("%H:%M:%S"))
 
     cmd = [
         "libcamera-jpeg", "-n",
         "--width", str(CAP_W), "--height", str(CAP_H),
-        "-o", tmp_path
+        "-o", TMP_PATH
     ]
     if AUTOFOCUS:
         cmd.extend(["--autofocus-mode", "continuous"])
@@ -197,35 +205,33 @@ def capture_once():
     try:
         run(cmd, check=True)
 
-        # Convert to grayscale
-        base_img = Image.open(tmp_path).convert("L")  # 'L' = 8-bit grayscale
+        # Convert to grayscale from RAM tmp
+        base_img = Image.open(TMP_PATH).convert("L")
 
-        # Enforce 100 KB cap using WebP-only
-        final_img, webp_bytes, used_q = _downscale_to_limit(
-            base_img, MAX_BYTES, min_side=MIN_SIDE_PX, q_min=Q_MIN, q_max=Q_MAX
-        )
+        # Enforce 100 KB cap with faster WebP path
+        final_img, webp_bytes, used_q = _downscale_to_limit(base_img, MAX_BYTES, min_side=MIN_SIDE_PX)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ts_path = os.path.join(PHOTOS_DIR, f"{ts}.webp")
 
-        # Save timestamped file and latest.webp (use the same capped bytes)
+        # Write timestamped + latest (same bytes, two writes but tiny)
         with open(ts_path, "wb") as f:
             f.write(webp_bytes)
         with open(LATEST_WEBP, "wb") as f:
             f.write(webp_bytes)
 
-        # 3s on-LCD preview of the final_img (what we actually stored)
+        # 3s LCD preview of the actual stored image
         lcd_show_preview(final_img, seconds=3.0)
 
         # Back to Ready
         lcd_show_text("Ready", "Press button / Web")
-        print(f"Captured {ts_path}  (quality≈{used_q}, size={len(webp_bytes)} bytes)")
+        print(f"Captured {ts_path}  (q≈{used_q}, bytes={len(webp_bytes)})")
 
         _broadcast({"type": "captured", "ts": int(datetime.now().timestamp())})
         return True, ts_path
     except CalledProcessError as e:
         lcd_show_text("Capture ERR", "See logs")
-        sleep(1.2)
+        sleep(1.0)
         lcd_show_text("Ready", "Press button / Web")
         print("Capture failed:", e)
         return False, str(e)
@@ -239,7 +245,6 @@ def button_worker():
 
 # =============== SSE (server-sent events) ===============
 _subscribers = []
-
 def _broadcast(obj):
     data = "data: " + json.dumps(obj) + "\n\n"
     dead = []
@@ -279,7 +284,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Pi BnW Cam (WebP ≤100 KB)</title>
+  <title>Pi BnW Cam (WebP ≤100 KB, fast)</title>
   <style>
     :root { --gap: 12px; color-scheme: light; }
     body{
@@ -312,7 +317,7 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
   <div class="toolbar">
-    <button id="captureBtn">Capture (WebP ≤100 KB)</button>
+    <button id="captureBtn">Capture (fast WebP ≤100 KB)</button>
     <span id="status" class="muted"></span>
   </div>
 
@@ -338,7 +343,7 @@ const countLocal = document.getElementById("countLocal");
 async function capture() {
   btn.disabled = true;
   btn.textContent = "Capturing…";
-  statusEl.textContent = "Taking picture, converting to WebP and capping at 100 KB…";
+  statusEl.textContent = "Capturing and encoding (fast)…";
   try {
     const r = await fetch("/capture", { method: "POST" });
     const data = await r.json();
@@ -351,7 +356,7 @@ async function capture() {
     statusEl.textContent = e.message || "Failed to capture. Check server logs.";
   } finally {
     btn.disabled = false;
-    btn.textContent = "Capture (WebP ≤100 KB)";
+    btn.textContent = "Capture (fast WebP ≤100 KB)";
   }
 }
 btn.addEventListener("click", capture);
@@ -461,7 +466,7 @@ def main():
     Thread(target=button_worker, daemon=True).start()
     print(f"Serving on http://0.0.0.0:{PORT}")
     try:
-        from waitress import serve as waitress_serve  # optional production WSGI
+        from waitress import serve as waitress_serve
         waitress_serve(app, host="0.0.0.0", port=PORT)
     except Exception:
         app.run(host="0.0.0.0", port=PORT, debug=False)
