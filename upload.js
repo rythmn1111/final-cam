@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// upload_one.js — simple Turbo upload using the same pattern as your server code
+// upload.js — Turbo upload helper for Arweave (CJS) with optional --json output
 
 const fs = require("fs");
 const path = require("path");
@@ -13,7 +13,6 @@ const MAX_BYTES = 100 * 1024;
 async function ensureTurbo(jwk) {
   const mod = await import("@ardrive/turbo-sdk");
   const { TurboFactory } = mod;
-  // same style you used before: auth with privateKey (JWK)
   return TurboFactory.authenticated({ privateKey: jwk });
 }
 
@@ -25,46 +24,77 @@ function assertFile(p) {
 }
 
 (async () => {
-  // pick file from argv or default
-  const filePath = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_FILE;
+  const argv = process.argv.slice(2);
+  const IS_JSON = argv.includes("--json");
+  const filtered = argv.filter((a) => a !== "--json");
+
+  const filePath = filtered[0] ? path.resolve(filtered[0]) : DEFAULT_FILE;
 
   assertFile(WALLET);
   assertFile(filePath);
 
   const size = fs.statSync(filePath).size;
   if (size > MAX_BYTES) {
-    console.error(`[!] ${path.basename(filePath)} is ${size} bytes (> 100 KB). Please shrink it first.`);
+    const msg = `${path.basename(filePath)} is ${size} bytes (> 100 KB). Please shrink it first.`;
+    if (IS_JSON) {
+      console.log(JSON.stringify({ ok: false, error: msg }));
+    } else {
+      console.error(`[!] ${msg}`);
+    }
     process.exit(1);
   }
 
-  console.log("[*] Loading wallet…");
+  if (!IS_JSON) console.log("[*] Loading wallet…");
   const jwk = JSON.parse(fs.readFileSync(WALLET, "utf8"));
 
-  console.log("[*] Authenticating Turbo client…");
+  if (!IS_JSON) console.log("[*] Authenticating Turbo client…");
   const turbo = await ensureTurbo(jwk);
 
-  console.log("[*] Uploading:", filePath);
+  if (!IS_JSON) console.log("[*] Uploading:", filePath);
+  const startedAt = Date.now();
   const result = await turbo.uploadFile({
     fileStreamFactory: () => fs.createReadStream(filePath),
     fileSizeFactory: () => size,
     dataItemOpts: {
       tags: [{ name: "Content-Type", value: "image/webp" }],
-      // If you have shared credits, you can add:
-      // paidBy: ["<address1>", "<address2>"],
     },
     events: {
-      onProgress: ({ totalBytes, processedBytes, step }) =>
-        process.stdout.write(`\r[progress] ${step} ${processedBytes}/${totalBytes} bytes       `),
-      onError: ({ error, step }) =>
-        console.error(`\n[error] step=${step}`, error?.message || error),
-      onUploadSuccess: () => console.log("\n[+] Upload success!"),
+      onProgress: ({ totalBytes, processedBytes, step }) => {
+        if (!IS_JSON) process.stdout.write(`\r[progress] ${step} ${processedBytes}/${totalBytes} bytes       `);
+      },
+      onError: ({ error, step }) => {
+        if (!IS_JSON) console.error(`\n[error] step=${step}`, error?.message || error);
+      },
+      onUploadSuccess: () => {
+        if (!IS_JSON) console.log("\n[+] Upload success!");
+      },
     },
   });
 
-  console.log("\n---");
-  console.log("Data Item ID:", result.id);
-  console.log("Gateway URL:  https://arweave.net/" + result.id);
+  const payload = {
+    ok: true,
+    id: result.id,
+    url: `https://arweave.net/${result.id}`,
+    size,
+    startedAt,
+    finishedAt: Date.now(),
+    file: path.basename(filePath),
+  };
+  if (IS_JSON) {
+    console.log(JSON.stringify(payload));
+  } else {
+    console.log("\n---");
+    console.log("Data Item ID:", result.id);
+    console.log("Gateway URL:  https://arweave.net/" + result.id);
+  }
 })().catch((e) => {
-  console.error("\n[!] Failed:", e?.message || e);
+  const msg = e?.message || e;
+  try {
+    if (process.argv.includes("--json")) {
+      console.log(JSON.stringify({ ok: false, error: String(msg) }));
+    } else {
+      console.error("\n[!] Failed:", msg);
+    }
+  } catch {}
   process.exit(1);
 });

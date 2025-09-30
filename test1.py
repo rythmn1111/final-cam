@@ -14,6 +14,7 @@ from threading import Thread, Lock
 from time import sleep
 
 from flask import Flask, Response, jsonify, send_file, abort, render_template_string
+from subprocess import PIPE
 from gpiozero import Button
 from PIL import Image, ImageDraw, ImageFont
 from st7735 import ST7735
@@ -31,6 +32,7 @@ BUTTON_BCM     = 13                  # joystick press pin
 AUTOFOCUS      = False               # set True only if you need AF and your module supports it
 
 PORT           = int(os.environ.get("PORT", "5050"))
+ARWEAVE_JSON   = os.path.join(PHOTOS_DIR, "arweave.json")
 MAX_BYTES      = 100 * 1024          # 100 KB hard cap per saved image
 
 # WebP encoder tuning (lighter for speed)
@@ -333,12 +335,58 @@ INDEX_HTML = """<!doctype html>
     <div id="gridLocal" class="grid"></div>
   </div>
 
+  <div class="section">
+    <h2>Arweave uploads <span class="muted" id="countAr"></span></h2>
+    <div id="gridAr" class="grid"></div>
+  </div>
+
 <script>
 const btn = document.getElementById("captureBtn");
 const statusEl = document.getElementById("status");
 const img = document.getElementById("preview");
 const gridLocal = document.getElementById("gridLocal");
 const countLocal = document.getElementById("countLocal");
+const gridAr = document.getElementById("gridAr");
+const countAr = document.getElementById("countAr");
+
+let promptTimer = null;
+let promptEl = null;
+function showUploadPrompt() {
+  // Create a temporary prompt under the hero image for 5s
+  clearUploadPrompt();
+  const hero = document.querySelector(".hero");
+  promptEl = document.createElement("div");
+  promptEl.style.marginTop = "8px";
+  let secs = 5;
+  promptEl.innerHTML = `
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span class="muted">Upload to Arweave?</span>
+      <button id="uploadNowBtn">Upload</button>
+      <span class="muted" id="countdown">(5s)</span>
+    </div>
+  `;
+  hero.appendChild(promptEl);
+  const btnUpload = promptEl.querySelector('#uploadNowBtn');
+  const cd = promptEl.querySelector('#countdown');
+  btnUpload.addEventListener('click', async () => {
+    btnUpload.disabled = true;
+    cd.textContent = '(uploading…)';
+    await uploadToArweave();
+    clearUploadPrompt();
+  });
+  promptTimer = setInterval(() => {
+    secs -= 1;
+    if (secs <= 0) {
+      clearUploadPrompt();
+    } else {
+      cd.textContent = `(${secs}s)`;
+    }
+  }, 1000);
+}
+function clearUploadPrompt(){
+  if (promptTimer){ clearInterval(promptTimer); promptTimer = null; }
+  if (promptEl){ promptEl.remove(); promptEl = null; }
+}
 
 async function capture() {
   btn.disabled = true;
@@ -351,6 +399,8 @@ async function capture() {
     img.src = "/latest.webp?ts=" + Date.now();
     statusEl.textContent = "Done.";
     await refreshGallery();
+    // After successful capture, show Arweave upload prompt for 5 seconds
+    showUploadPrompt();
   } catch (e) {
     console.error(e);
     statusEl.textContent = e.message || "Failed to capture. Check server logs.";
@@ -370,6 +420,7 @@ try {
       if (msg.type === "captured") {
         img.src = "/latest.webp?ts=" + msg.ts;
         await refreshGallery();
+        showUploadPrompt();
       }
     } catch {}
   };
@@ -399,6 +450,23 @@ function renderLocal(items){
   }
 }
 
+function renderArweave(items){
+  gridAr.innerHTML = "";
+  countAr.textContent = `(${items.length})`;
+  for (const it of items){
+    const dt = new Date(it.tsMs || Date.now());
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <a href="${it.url}" target="_blank" rel="noopener">
+        <img class="thumb" loading="lazy" src="${it.url}" alt="${it.id}" />
+      </a>
+      <div class="meta">${dt.toLocaleString()}</div>
+    `;
+    gridAr.appendChild(card);
+  }
+}
+
 async function refreshGallery(){
   try{
     const r = await fetch("/gallery.json");
@@ -411,9 +479,35 @@ async function refreshGallery(){
   }
 }
 
+async function refreshArweave(){
+  try{
+    const r = await fetch("/arweave.json");
+    const data = await r.json();
+    if (!data.ok) throw new Error("Arweave list failed");
+    renderArweave(data.items || []);
+  }catch(e){
+    console.error(e);
+  }
+}
+
+async function uploadToArweave(){
+  statusEl.textContent = "Uploading to Arweave…";
+  try{
+    const r = await fetch("/upload_arweave", { method: "POST" });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Upload failed');
+    statusEl.textContent = "Uploaded to Arweave.";
+    await refreshArweave();
+  }catch(e){
+    console.error(e);
+    statusEl.textContent = e.message || 'Upload failed';
+  }
+}
+
 (async function init(){
   img.src = "/latest.webp?ts=" + Date.now();
   await refreshGallery();
+  await refreshArweave();
 })();
 </script>
 </body>
@@ -454,6 +548,81 @@ def gallery():
             "mtimeMs": int(st.st_mtime * 1000),
         })
     return jsonify({"ok": True, "local": items})
+
+@app.route("/arweave.json")
+def arweave_list():
+    try:
+        if not os.path.exists(ARWEAVE_JSON):
+            return jsonify({"ok": True, "items": []})
+        with open(ARWEAVE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+        return jsonify({"ok": True, "items": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+def _append_arweave_record(record):
+    try:
+        os.makedirs(PHOTOS_DIR, exist_ok=True)
+        existing = []
+        if os.path.exists(ARWEAVE_JSON):
+            with open(ARWEAVE_JSON, "r", encoding="utf-8") as f:
+                try:
+                    existing = json.load(f)
+                    if not isinstance(existing, list):
+                        existing = []
+                except Exception:
+                    existing = []
+        existing.append(record)
+        with open(ARWEAVE_JSON, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Failed to persist arweave.json:", e)
+
+@app.route("/upload_arweave", methods=["POST"])
+def upload_arweave():
+    try:
+        # choose latest file (use latest.webp if exists)
+        src = LATEST_WEBP if os.path.exists(LATEST_WEBP) else None
+        if not src or not os.path.exists(src):
+            # fallback to newest .webp in folder
+            files = _list_webps_sorted()
+            if files:
+                src = str(files[-1])
+        if not src or not os.path.exists(src):
+            return jsonify({"ok": False, "error": "No image available to upload"}), 400
+
+        # call Node uploader with --json
+        here = os.path.dirname(os.path.abspath(__file__))
+        upload_js = os.path.join(here, "upload.js")
+        if not os.path.exists(upload_js):
+            return jsonify({"ok": False, "error": "upload.js not found"}), 500
+
+        try:
+            proc = run(["node", upload_js, "--json", src], check=True, stdout=PIPE, stderr=PIPE)
+            out = proc.stdout.decode("utf-8", errors="ignore").strip()
+            data = json.loads(out)
+        except CalledProcessError as e:
+            err = e.stderr.decode("utf-8", errors="ignore")
+            return jsonify({"ok": False, "error": err or str(e)}), 500
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        if not data.get("ok"):
+            return jsonify({"ok": False, "error": data.get("error", "Upload failed")}), 500
+
+        record = {
+            "id": data.get("id"),
+            "url": data.get("url"),
+            "size": data.get("size"),
+            "file": data.get("file"),
+            "tsMs": int(datetime.now().timestamp() * 1000),
+        }
+        _append_arweave_record(record)
+        return jsonify({"ok": True, "record": record})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/capture", methods=["POST"])
 def capture():
