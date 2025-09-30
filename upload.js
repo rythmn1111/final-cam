@@ -9,6 +9,15 @@ const WALLET = path.join(ROOT, "wallet.json");
 const DEFAULT_FILE = path.join(ROOT, "test.webp");
 const MAX_BYTES = 100 * 1024;
 
+// Load environment variables from .env.local or .env if present
+try {
+  const dotenv = require("dotenv");
+  const envLocal = path.join(ROOT, ".env.local");
+  const envDefault = path.join(ROOT, ".env");
+  if (fs.existsSync(envLocal)) dotenv.config({ path: envLocal });
+  else if (fs.existsSync(envDefault)) dotenv.config({ path: envDefault });
+} catch {}
+
 // dynamic import so we can stay in CommonJS
 async function ensureTurbo(jwk) {
   const mod = await import("@ardrive/turbo-sdk");
@@ -80,6 +89,24 @@ function assertFile(p) {
     finishedAt: Date.now(),
     file: path.basename(filePath),
   };
+  // Optional: insert into Supabase if env vars are present
+  try {
+    const supaUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supaKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    const table = process.env.SUPABASE_TABLE || "links";
+    const linkColumn = process.env.SUPABASE_LINK_COLUMN || "links";
+    if (supaUrl && supaKey) {
+      const { createClient } = await import("@supabase/supabase-js");
+      const supabase = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
+      const insertData = { [linkColumn]: payload.url };
+      const { error } = await supabase.from(table).insert(insertData);
+      if (error && !IS_JSON) console.warn("[supabase] insert error:", error.message || error);
+    } else if (!IS_JSON) {
+      console.log("[supabase] Skipped insert (missing SUPABASE_URL or key)");
+    }
+  } catch (e) {
+    if (!IS_JSON) console.warn("[supabase] insert failed:", e?.message || e);
+  }
   if (IS_JSON) {
     console.log(JSON.stringify(payload));
   } else {
