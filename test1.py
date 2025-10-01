@@ -283,117 +283,6 @@ def button_worker():
             capture_once()
         sleep(0.2)
 
-# =============== Background Auto-Upload ===============
-_upload_queue = []
-_upload_lock = Lock()
-_upload_thread_running = False
-
-def _mark_as_uploaded(file_path):
-    """Mark a file as uploaded by creating a .uploaded flag file."""
-    try:
-        flag_path = file_path + ".uploaded"
-        with open(flag_path, "w") as f:
-            f.write(str(int(datetime.now().timestamp())))
-    except Exception as e:
-        print(f"Failed to mark {file_path} as uploaded: {e}")
-
-def _is_uploaded(file_path):
-    """Check if a file has been uploaded by looking for .uploaded flag."""
-    try:
-        return os.path.exists(file_path + ".uploaded")
-    except:
-        return False
-
-def _scan_for_unuploaded():
-    """Scan photos directory for images that haven't been uploaded to Arweave."""
-    try:
-        files = _list_webps_sorted()
-        unuploaded = []
-        for f in files:
-            if not _is_uploaded(str(f)):
-                unuploaded.append(str(f))
-        return unuploaded
-    except Exception as e:
-        print(f"Error scanning for unuploaded files: {e}")
-        return []
-
-def _background_upload_worker():
-    """Background thread that uploads unuploaded images to Arweave."""
-    global _upload_thread_running
-    _upload_thread_running = True
-    print("Background upload worker started")
-    
-    while _upload_thread_running:
-        try:
-            # Scan for unuploaded files
-            unuploaded = _scan_for_unuploaded()
-            if unuploaded:
-                print(f"Found {len(unuploaded)} unuploaded images")
-                
-                for file_path in unuploaded:
-                    if not _upload_thread_running:  # Check if we should stop
-                        break
-                        
-                    print(f"Auto-uploading: {os.path.basename(file_path)}")
-                    try:
-                        # Use the same upload logic as manual upload
-                        ok, result = _perform_arweave_upload_with_file(file_path)
-                        if ok:
-                            _mark_as_uploaded(file_path)
-                            print(f"✓ Auto-uploaded: {os.path.basename(file_path)}")
-                        else:
-                            print(f"✗ Auto-upload failed: {os.path.basename(file_path)} - {result}")
-                    except Exception as e:
-                        print(f"✗ Auto-upload error: {os.path.basename(file_path)} - {e}")
-                    
-                    # Small delay between uploads
-                    sleep(2)
-            
-            # Wait 60 seconds before next scan
-            for _ in range(60):
-                if not _upload_thread_running:
-                    break
-                sleep(1)
-                
-        except Exception as e:
-            print(f"Background upload worker error: {e}")
-            sleep(10)  # Wait before retrying
-    
-    print("Background upload worker stopped")
-
-def _perform_arweave_upload_with_file(file_path):
-    """Upload a specific file to Arweave (similar to _perform_arweave_upload but with file path)."""
-    if not os.path.exists(file_path):
-        return False, "File not found"
-    
-    # call Node uploader with --json
-    here = os.path.dirname(os.path.abspath(__file__))
-    upload_js = os.path.join(here, "upload.js")
-    if not os.path.exists(upload_js):
-        return False, "upload.js not found"
-    
-    try:
-        proc = run(["node", upload_js, "--json", file_path], check=True, stdout=PIPE, stderr=PIPE)
-        out = proc.stdout.decode("utf-8", errors="ignore").strip()
-        data = json.loads(out)
-    except CalledProcessError as e:
-        err = e.stderr.decode("utf-8", errors="ignore")
-        return False, err or str(e)
-    except Exception as e:
-        return False, str(e)
-    
-    if not data.get("ok"):
-        return False, data.get("error", "Upload failed")
-    
-    record = {
-        "id": data.get("id"),
-        "url": data.get("url"),
-        "size": data.get("size"),
-        "file": data.get("file"),
-        "tsMs": int(datetime.now().timestamp() * 1000),
-    }
-    _append_arweave_record(record)
-    return True, record
 
 # =============== SSE (server-sent events) ===============
 _subscribers = []
@@ -780,9 +669,7 @@ def capture():
 
 def main():
     Thread(target=button_worker, daemon=True).start()
-    Thread(target=_background_upload_worker, daemon=True).start()
     print(f"Serving on http://0.0.0.0:{PORT}")
-    print("Background auto-upload enabled")
     try:
         from waitress import serve as waitress_serve
         waitress_serve(app, host="0.0.0.0", port=PORT)
