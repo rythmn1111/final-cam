@@ -676,6 +676,14 @@ def _perform_arweave_upload_with_file(file_path):
         "tsMs": int(datetime.now().timestamp() * 1000),
     }
     _append_arweave_record(record)
+    
+    # Delete local file after successful upload
+    try:
+        os.remove(file_path)
+        print(f"Deleted local file: {os.path.basename(file_path)}")
+    except Exception as e:
+        print(f"Failed to delete local file {os.path.basename(file_path)}: {e}")
+    
     return True, record
 
 def _perform_arweave_upload():
