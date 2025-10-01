@@ -358,6 +358,7 @@ INDEX_HTML = """<!doctype html>
 <body>
   <div class="toolbar">
     <button id="captureBtn">Capture (fast WebP ≤100 KB)</button>
+    <button id="uploadAllBtn">Upload All to Arweave</button>
     <span id="status" class="muted"></span>
   </div>
 
@@ -380,6 +381,7 @@ INDEX_HTML = """<!doctype html>
 
 <script>
 const btn = document.getElementById("captureBtn");
+const uploadAllBtn = document.getElementById("uploadAllBtn");
 const statusEl = document.getElementById("status");
 const img = document.getElementById("preview");
 const gridLocal = document.getElementById("gridLocal");
@@ -407,6 +409,7 @@ async function capture() {
   }
 }
 btn.addEventListener("click", capture);
+uploadAllBtn.addEventListener("click", uploadAllToArweave);
 
 // SSE: captured -> refresh
 try {
@@ -486,7 +489,49 @@ async function refreshArweave(){
   }
 }
 
-(async function noop(){})();
+async function uploadAllToArweave(){
+  uploadAllBtn.disabled = true;
+  uploadAllBtn.textContent = "Uploading…";
+  statusEl.textContent = "Starting bulk upload to Arweave…";
+  try {
+    const r = await fetch("/gallery.json");
+    const data = await r.json();
+    if (!data.ok) throw new Error("Failed to load gallery");
+    const localItems = data.local || [];
+    if (localItems.length === 0) {
+      statusEl.textContent = "No local images to upload.";
+      return;
+    }
+    let success = 0, failed = 0;
+    for (let i = 0; i < localItems.length; i++) {
+      const item = localItems[i];
+      statusEl.textContent = `Uploading ${i+1}/${localItems.length}: ${item.name}`;
+      try {
+        const uploadR = await fetch("/upload_arweave", { method: "POST" });
+        const uploadData = await uploadR.json();
+        if (uploadData.ok) {
+          success++;
+        } else {
+          failed++;
+          console.warn(`Failed to upload ${item.name}:`, uploadData.error);
+        }
+      } catch (e) {
+        failed++;
+        console.warn(`Failed to upload ${item.name}:`, e);
+      }
+      // Small delay between uploads to avoid overwhelming
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    statusEl.textContent = `Bulk upload complete: ${success} success, ${failed} failed.`;
+    await refreshArweave();
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = e.message || "Bulk upload failed.";
+  } finally {
+    uploadAllBtn.disabled = false;
+    uploadAllBtn.textContent = "Upload All to Arweave";
+  }
+}
 
 (async function init(){
   img.src = "/latest.webp?ts=" + Date.now();
