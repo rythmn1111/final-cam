@@ -13,7 +13,7 @@ from subprocess import run, CalledProcessError
 from threading import Thread, Lock
 from time import sleep, time
 
-from flask import Flask, Response, jsonify, send_file, abort, render_template_string
+from flask import Flask, Response, jsonify, send_file, abort, render_template_string, request
 from subprocess import PIPE
 from gpiozero import Button
 from PIL import Image, ImageDraw, ImageFont
@@ -508,7 +508,11 @@ async function uploadAllToArweave(){
       const item = localItems[i];
       statusEl.textContent = `Uploading ${i+1}/${localItems.length}: ${item.name}`;
       try {
-        const uploadR = await fetch("/upload_arweave", { method: "POST" });
+        const uploadR = await fetch("/upload_arweave_file", { 
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: item.name })
+        });
         const uploadData = await uploadR.json();
         if (uploadData.ok) {
           success++;
@@ -619,6 +623,60 @@ def upload_arweave():
         return jsonify({"ok": True, "record": payload})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/upload_arweave_file", methods=["POST"])
+def upload_arweave_file():
+    try:
+        data = request.get_json()
+        if not data or 'filename' not in data:
+            return jsonify({"ok": False, "error": "filename required"}), 400
+        
+        filename = data['filename']
+        file_path = os.path.join(PHOTOS_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            return jsonify({"ok": False, "error": "File not found"}), 404
+        
+        ok, payload = _perform_arweave_upload_with_file(file_path)
+        if not ok:
+            return jsonify({"ok": False, "error": payload}), 500
+        return jsonify({"ok": True, "record": payload})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+def _perform_arweave_upload_with_file(file_path):
+    """Upload a specific file to Arweave."""
+    if not os.path.exists(file_path):
+        return False, "File not found"
+    
+    # call Node uploader with --json
+    here = os.path.dirname(os.path.abspath(__file__))
+    upload_js = os.path.join(here, "upload.js")
+    if not os.path.exists(upload_js):
+        return False, "upload.js not found"
+    
+    try:
+        proc = run(["node", upload_js, "--json", file_path], check=True, stdout=PIPE, stderr=PIPE)
+        out = proc.stdout.decode("utf-8", errors="ignore").strip()
+        data = json.loads(out)
+    except CalledProcessError as e:
+        err = e.stderr.decode("utf-8", errors="ignore")
+        return False, err or str(e)
+    except Exception as e:
+        return False, str(e)
+    
+    if not data.get("ok"):
+        return False, data.get("error", "Upload failed")
+    
+    record = {
+        "id": data.get("id"),
+        "url": data.get("url"),
+        "size": data.get("size"),
+        "file": data.get("file"),
+        "tsMs": int(datetime.now().timestamp() * 1000),
+    }
+    _append_arweave_record(record)
+    return True, record
 
 def _perform_arweave_upload():
     """Uploads latest .webp to Arweave using Node helper, persists record, returns (ok, data|error)."""
